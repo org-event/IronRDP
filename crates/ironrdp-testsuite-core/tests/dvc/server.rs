@@ -312,6 +312,32 @@ fn server_tracks_readiness_and_creates_boxed_dynamic_channel() {
     assert_eq!(channel.processor().received, vec![id.to_le_bytes().to_vec()]);
 }
 
+#[test]
+fn server_finds_and_drives_an_opened_channel_by_name() {
+    let (mut server, channel_id) = open_recorded_server(None);
+    assert_eq!(server.opened_channel_id_by_name("recorded"), Some(channel_id));
+    assert_eq!(server.opened_channel_id_by_name("other"), None);
+
+    let messages = server
+        .with_opened_channel(channel_id, |processor| {
+            let recorded = processor
+                .as_any_mut()
+                .downcast_mut::<RecordedServerDvc>()
+                .expect("recorded processor");
+            recorded.received.push(b"run".to_vec());
+            Ok(vec![Box::new(TestPayload(b"out".to_vec())) as DvcMessage])
+        })
+        .expect("channel is opened")
+        .expect("closure succeeds");
+    assert_eq!(messages.len(), 1);
+    let channel = server.dvc_by_id::<RecordedServerDvc>(channel_id).unwrap();
+    assert_eq!(channel.processor().received, vec![b"run".to_vec()]);
+
+    let _ = server.close_channel(channel_id);
+    assert_eq!(server.opened_channel_id_by_name("recorded"), None);
+    assert!(server.with_opened_channel(channel_id, |_| Ok(Vec::new())).is_none());
+}
+
 proptest::proptest! {
     #![proptest_config(proptest::test_runner::Config::with_cases(32))]
     // oracle: property round-trip.

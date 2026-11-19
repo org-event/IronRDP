@@ -1655,6 +1655,8 @@ pub enum ServerEvent {
     Rdpdr(RdpdrServerMessage),
     Rdpeai(RdpeaiServerMessage),
     Echo(EchoServerMessage),
+    /// Opens, drives or closes a dynamic channel the embedder creates at runtime.
+    Dvc(DvcServerMessage),
     SetCredentials(Credentials),
     /// Accept any of these credentials from the next connection on; see
     /// [`RdpServer::set_credential_list`].
@@ -1707,6 +1709,7 @@ impl fmt::Debug for ServerEvent {
             Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
             Self::Rdpeai(..) => f.write_str("Rdpeai(..)"),
             Self::Echo(..) => f.write_str("Echo(..)"),
+            Self::Dvc(message) => f.debug_tuple("Dvc").field(message).finish(),
             Self::SetCredentials(..) => f.write_str("SetCredentials(..)"),
             Self::SetCredentialList(..) => f.write_str("SetCredentialList(..)"),
             Self::SetAutoReconnectCookie(Some(..)) => f.write_str("SetAutoReconnectCookie(Some(..))"),
@@ -1718,6 +1721,35 @@ impl fmt::Debug for ServerEvent {
             #[cfg(feature = "usb")]
             Self::Usb(..) => f.write_str("Usb(..)"),
             Self::AutoDetectRttRequest => f.write_str("AutoDetectRttRequest"),
+        }
+    }
+}
+
+/// Runs on a runtime-created dynamic channel's processor; see [`DvcServerMessage::Run`].
+pub type DvcRun = Box<dyn FnOnce(&mut dyn dvc::DvcServerProcessor) -> PduResult<Vec<dvc::DvcMessage>> + Send>;
+
+/// A dynamic channel the embedder creates while the session runs, such as a
+/// device channel whose name the client announces on another channel.
+///
+/// Channels are found by name. Every variant is dropped with a warning when
+/// DRDYNVC is not ready or no opened channel has the name.
+pub enum DvcServerMessage {
+    /// Sends a Create Request for this processor's channel.
+    Open(Box<dyn dvc::DvcServerProcessor>),
+    /// Runs a closure on the opened channel and sends the messages it returns.
+    ///
+    /// The closure can downcast the processor through `as_any_mut`.
+    Run { channel_name: String, run: DvcRun },
+    /// Closes the opened channel.
+    Close { channel_name: String },
+}
+
+impl fmt::Debug for DvcServerMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Open(processor) => f.debug_tuple("Open").field(&processor.channel_name()).finish(),
+            Self::Run { channel_name, .. } => f.debug_struct("Run").field("channel_name", channel_name).finish(),
+            Self::Close { channel_name } => f.debug_struct("Close").field("channel_name", channel_name).finish(),
         }
     }
 }
@@ -4488,6 +4520,56 @@ impl RdpServer {
                         .get_channel_id_by_type::<dvc::DrdynvcServer>()
                         .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
                     let data = server_encode_svc_messages(dvc_messages, drdynvc_channel_id, user_channel_id)
+                        .map_err(ServerError::encode)?;
+                    writer
+                        .write_all(&data)
+                        .await
+                        .map_err(|e| ServerError::io("write_all", e))?;
+                }
+                ServerEvent::Dvc(message) => {
+                    let Some(drdynvc) = conn.get_svc_processor::<dvc::DrdynvcServer>() else {
+                        warn!(?message, "No drdynvc channel, dropping dynamic channel event");
+                        continue;
+                    };
+                    let msgs = match message {
+                        DvcServerMessage::Open(processor) => {
+                            let name = processor.channel_name().to_owned();
+                            match drdynvc.create_channel_boxed_with(Box::new(move |_| processor)) {
+                                Ok(msg) => vec![msg],
+                                Err(error) => {
+                                    warn!(%error, channel = name, "Dynamic channel not created");
+                                    continue;
+                                }
+                            }
+                        }
+                        DvcServerMessage::Run { channel_name, run } => {
+                            let Some(channel_id) = drdynvc.opened_channel_id_by_name(&channel_name) else {
+                                warn!(channel = channel_name, "Dynamic channel not opened, dropping event");
+                                continue;
+                            };
+                            match drdynvc.with_opened_channel(channel_id, run) {
+                                Some(Ok(msgs)) => msgs,
+                                Some(Err(error)) => {
+                                    warn!(%error, channel = channel_name, "Dynamic channel event failed");
+                                    continue;
+                                }
+                                None => continue,
+                            }
+                        }
+                        DvcServerMessage::Close { channel_name } => {
+                            let Some(channel_id) = drdynvc.opened_channel_id_by_name(&channel_name) else {
+                                continue;
+                            };
+                            drdynvc.close_channel(channel_id).into_iter().collect()
+                        }
+                    };
+                    if msgs.is_empty() {
+                        continue;
+                    }
+                    let drdynvc_channel_id = conn
+                        .get_channel_id_by_type::<dvc::DrdynvcServer>()
+                        .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
+                    let data = server_encode_svc_messages(msgs, drdynvc_channel_id, user_channel_id)
                         .map_err(ServerError::encode)?;
                     writer
                         .write_all(&data)

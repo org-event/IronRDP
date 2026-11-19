@@ -335,6 +335,36 @@ impl DrdynvcServer {
         })
     }
 
+    /// Returns the ID of the opened channel named `name`.
+    ///
+    /// When several opened channels share the name, the one opened last wins.
+    pub fn opened_channel_id_by_name(&self, name: &str) -> Option<u32> {
+        self.dynamic_channels
+            .dynamic_channels
+            .iter()
+            .rev()
+            .find(|(_, channel)| channel.state == ChannelState::Opened && channel.processor.channel_name() == name)
+            .map(|(id, _)| *id)
+    }
+
+    /// Runs `f` on the opened channel `channel_id` and encodes the messages it returns.
+    ///
+    /// Lets an embedder drive a runtime-created processor outside of
+    /// [`DvcProcessor::process`], for example to send a request on its own.
+    /// Returns `None` when no such channel is opened.
+    pub fn with_opened_channel<F>(&mut self, channel_id: u32, f: F) -> Option<PduResult<Vec<SvcMessage>>>
+    where
+        F: FnOnce(&mut dyn DvcServerProcessor) -> PduResult<Vec<crate::DvcMessage>>,
+    {
+        let channel = self.dynamic_channels.get_mut(channel_id)?;
+        if channel.state != ChannelState::Opened {
+            return None;
+        }
+        Some(f(channel.processor.as_mut()).and_then(|messages| {
+            encode_dvc_messages(channel_id, messages, ChannelFlags::SHOW_PROTOCOL).map_err(|e| encode_err!(e))
+        }))
+    }
+
     pub fn close_channel(&mut self, channel_id: u32) -> Option<SvcMessage> {
         let channel = self.remove_by_channel_id(channel_id)?;
         self.outgoing_tunnel_channels.remove(&channel_id);
